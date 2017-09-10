@@ -499,9 +499,12 @@ int cap_bprm_set_creds(struct linux_binprm *bprm)
 {
 	const struct cred *old = current_cred();
 	struct cred *new = bprm->cred;
-	bool effective, has_cap = false;
+	bool effective, has_cap = false, is_setid;
 	int ret;
 	kuid_t root_uid;
+	
+        if (WARN_ON(!cap_ambient_invariant_ok(old)))
+		return -EPERM;
 
 	effective = false;
 	ret = get_file_caps(bprm, &effective, &has_cap);
@@ -547,8 +550,9 @@ skip:
 	 *
 	 * In addition, if NO_NEW_PRIVS, then ensure we get no new privs.
 	 */
-	if ((!uid_eq(new->euid, old->uid) ||
-	     !gid_eq(new->egid, old->gid) ||
+	is_setid = new->euid != old->uid || new->egid != old->gid;
+
+	if ((is_setid |
 	     !cap_issubset(new->cap_permitted, old->cap_permitted)) &&
 	    bprm->unsafe & ~LSM_UNSAFE_PTRACE_CAP) {
 		/* downgrade; they get no more than they had, and maybe less */
@@ -563,11 +567,30 @@ skip:
 
 	new->suid = new->fsuid = new->euid;
 	new->sgid = new->fsgid = new->egid;
+	
+        /* File caps or setid cancels ambient. */
+        if (has_cap || is_setid)
+		cap_clear(new->cap_ambient);
+	
+        /*
+         * Now that we've computed pA', update pP' to give:
+         *   pP' = (X & fP) | (pI & fI) | pA'
+         */
+	new->cap_permitted = cap_combine(new->cap_permitted, new->cap_ambient);
+
+        /*
+         * Set pE' = (fE ? pP' : pA').  Because pA' is zero if fE is set,
+         * this is the same as pE' = (fE ? pP' : 0) | pA'.
+         */
 
 	if (effective)
 		new->cap_effective = new->cap_permitted;
 	else
-		cap_clear(new->cap_effective);
+		new->cap_effective = new->cap_ambient;
++
++	if (WARN_ON(!cap_ambient_invariant_ok(new)))
++		return -EPERM;
+	
 	bprm->cap_effective = effective;
 
 	/*
@@ -582,7 +605,7 @@ skip:
 	 * Number 1 above might fail if you don't have a full bset, but I think
 	 * that is interesting information to audit.
 	 */
-	if (!cap_isclear(new->cap_effective)) {
+	if (!cap_issubset(new->cap_effective, new->cap_ambient)) {
 		if (!cap_issubset(CAP_FULL_SET, new->cap_effective) ||
 		    !uid_eq(new->euid, root_uid) || !uid_eq(new->uid, root_uid) ||
 		    issecure(SECURE_NOROOT)) {
@@ -593,6 +616,9 @@ skip:
 	}
 
 	new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
+	 (WARN_ON(!cap_ambient_invariant_ok(new)))
+              return -EPERM;
+	
 	return 0;
 }
 
@@ -614,7 +640,7 @@ int cap_bprm_secureexec(struct linux_binprm *bprm)
 	if (!uid_eq(cred->uid, root_uid)) {
 		if (bprm->cap_effective)
 			return 1;
-		if (!cap_isclear(cred->cap_permitted))
+		if (!cap_issubset(cred->cap_permitted, cred->cap_ambient))
 			return 1;
 	}
 
@@ -948,6 +974,43 @@ int cap_task_prctl(int option, unsigned long arg2, unsigned long arg3,
 		else
 			new->securebits &= ~issecure_mask(SECURE_KEEP_CAPS);
 		return commit_creds(new);
+		
+        case PR_CAP_AMBIENT:
+		if (arg2 == PR_CAP_AMBIENT_CLEAR_ALL) {
+			if (arg3 | arg4 | arg5)
+				return -EINVAL;
+
+			new = prepare_creds();
+			if (!new)
+				return -ENOMEM;
+			cap_clear(new->cap_ambient);
+			return commit_creds(new);
+		}
+
+		if (((!cap_valid(arg3)) | arg4 | arg5))
+			return -EINVAL;
+
+		if (arg2 == PR_CAP_AMBIENT_IS_SET) {
+			return !!cap_raised(current_cred()->cap_ambient, arg3);
+		} else if (arg2 != PR_CAP_AMBIENT_RAISE &&
+			   arg2 != PR_CAP_AMBIENT_LOWER) {
+			return -EINVAL;
+		} else {
+			if (arg2 == PR_CAP_AMBIENT_RAISE &&
+			    (!cap_raised(current_cred()->cap_permitted, arg3) ||
+			     !cap_raised(current_cred()->cap_inheritable,
+					 arg3)))
+				return -EPERM;
+
+			new = prepare_creds();
+			if (!new)
+				return -ENOMEM;
+			if (arg2 == PR_CAP_AMBIENT_RAISE)
+				cap_raise(new->cap_ambient, arg3);
+			else
+				cap_lower(new->cap_ambient, arg3);
+			return commit_creds(new);
+		}
 
 	default:
 		/* No functionality available - continue with default */
